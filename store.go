@@ -132,6 +132,7 @@ type ChangedFile struct {
 // change), mutations take the write lock.
 type Store struct {
 	mu        sync.RWMutex
+	packMu    sync.Mutex // serialises pack builds: one build per cache key
 	clock     *ForgeClock
 	viewer    Identity
 	token     string
@@ -975,6 +976,20 @@ func (s *Store) fetchPack(repo *Repo, wants, haves []string, depth int, hasDepth
 		return cached, shallowOut, unshallowOut
 	}
 
+	// Singleflight: without this, N concurrent clones of the same repo
+	// all miss the cache and all pay the full reachability walk + sort
+	// + deflate. The first builder fills the cache; the rest re-check
+	// it and return immediately.
+	s.packMu.Lock()
+	defer s.packMu.Unlock()
+	s.mu.RLock()
+	cached, hit = s.packCache[key]
+	s.mu.RUnlock()
+	if hit {
+		shallowOut, unshallowOut = s.shallowInfo(wants, depth, hasDepth, shallow)
+		return cached, shallowOut, unshallowOut
+	}
+
 	s.mu.RLock()
 	var stopAt map[string]bool
 	if len(shallow) > 0 {
@@ -988,10 +1003,14 @@ func (s *Store) fetchPack(repo *Repo, wants, haves []string, depth int, hasDepth
 		exclude = s.reachableLocked(haves, reachOpts{stopAt: stopAt})
 	}
 	wanted := s.reachableLocked(wants, reachOpts{depth: depth, hasDepth: hasDepth, exclude: exclude})
-	objects := make([]GitObject, 0, len(wanted))
+	type rankedObj struct {
+		obj GitObject
+		oid string
+	}
+	ranked := make([]rankedObj, 0, len(wanted))
 	for oid := range wanted {
 		if object, ok := s.objects[oid]; ok {
-			objects = append(objects, object)
+			ranked = append(ranked, rankedObj{object, oid})
 		}
 	}
 	s.mu.RUnlock()
@@ -1010,14 +1029,6 @@ func (s *Store) fetchPack(repo *Repo, wants, haves []string, depth int, hasDepth
 			return 3
 		}
 	}
-	type rankedObj struct {
-		obj GitObject
-		oid string
-	}
-	ranked := make([]rankedObj, 0, len(objects))
-	for _, object := range objects {
-		ranked = append(ranked, rankedObj{object, hashObject(object.Type, object.Data)})
-	}
 	sort.Slice(ranked, func(i, j int) bool {
 		ri, rj := rank(ranked[i].obj.Type), rank(ranked[j].obj.Type)
 		if ri != rj {
@@ -1025,7 +1036,7 @@ func (s *Store) fetchPack(repo *Repo, wants, haves []string, depth int, hasDepth
 		}
 		return ranked[i].oid < ranked[j].oid
 	})
-	objects = objects[:0]
+	objects := make([]GitObject, 0, len(ranked))
 	for _, r := range ranked {
 		objects = append(objects, r.obj)
 	}
